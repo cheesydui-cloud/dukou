@@ -64,38 +64,83 @@ ensure_tty() {
 
 ensure_tty
 
-# -----------------------
-# 安装依赖
+# 只补缺的包，避免 apt upgrade 连带重启 sshd 把当前会话踢掉
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+missing_pkgs() {
+    local pkg
+    for pkg in "$@"; do
+        case "$pkg" in
+            curl) need_cmd curl || echo curl ;;
+            openssl) need_cmd openssl || echo openssl ;;
+            jq) need_cmd jq || echo jq ;;
+            bash) need_cmd bash || echo bash ;;
+            ca-certificates)
+                [ -d /etc/ssl/certs ] || echo ca-certificates
+                ;;
+            iproute2|iproute)
+                need_cmd ss || need_cmd ip || echo "$pkg"
+                ;;
+            libcap2-bin|libcap)
+                need_cmd setcap || echo "$pkg"
+                ;;
+            openrc)
+                need_cmd rc-update || echo openrc
+                ;;
+            *) echo "$pkg" ;;
+        esac
+    done
+}
+
 install_deps() {
-    info "安装系统依赖..."
-    
+    local pkgs=""
+    info "检查系统依赖..."
+
+    # Ubuntu/Debian 的 needrestart 会在装包后重启 ssh，表现为“选完菜单就掉线”
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=l
+    export NEEDRESTART_SUSPEND=1
+
     case "$OS" in
         alpine)
+            pkgs=$(missing_pkgs bash curl ca-certificates openssl openrc jq iproute2 libcap | tr '\n' ' ')
+            if [ -z "${pkgs// /}" ]; then
+                info "依赖已齐全，跳过 apk"
+                return 0
+            fi
+            info "安装缺失依赖: $pkgs"
             apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq iproute2 libcap || {
-                err "依赖安装失败"
-                exit 1
-            }
+            # shellcheck disable=SC2086
+            apk add --no-cache $pkgs || { err "依赖安装失败"; exit 1; }
             ;;
         debian)
-            export DEBIAN_FRONTEND=noninteractive
+            pkgs=$(missing_pkgs curl ca-certificates openssl jq iproute2 libcap2-bin | tr '\n' ' ')
+            if [ -z "${pkgs// /}" ]; then
+                info "依赖已齐全，跳过 apt（避免升级 ssh/openssl 断开当前会话）"
+                return 0
+            fi
+            info "安装缺失依赖: $pkgs"
             apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq iproute2 libcap2-bin || {
+            # --no-upgrade：已装的包保持不动，降低 sshd 被重启的概率
+            # shellcheck disable=SC2086
+            apt-get install -y --no-install-recommends --no-upgrade $pkgs || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
+            pkgs=$(missing_pkgs curl ca-certificates openssl jq iproute libcap | tr '\n' ' ')
+            if [ -z "${pkgs// /}" ]; then
+                info "依赖已齐全，跳过 yum/dnf"
+                return 0
+            fi
+            info "安装缺失依赖: $pkgs"
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl ca-certificates openssl jq iproute libcap || {
-                    err "依赖安装失败"
-                    exit 1
-                }
+                # shellcheck disable=SC2086
+                dnf install -y $pkgs || { err "依赖安装失败"; exit 1; }
             else
-                yum install -y curl ca-certificates openssl jq iproute libcap || {
-                    err "依赖安装失败"
-                    exit 1
-                }
+                # shellcheck disable=SC2086
+                yum install -y $pkgs || { err "依赖安装失败"; exit 1; }
             fi
             ;;
         *)
@@ -103,7 +148,7 @@ install_deps() {
             exit 1
             ;;
     esac
-    
+
     info "依赖安装完成"
 }
 
@@ -137,10 +182,37 @@ mark_port() {
     USED_PORTS="${USED_PORTS} $1 "
 }
 
+reserved_port() {
+    local p="$1"
+    [ "$p" = "22" ] && return 0
+    # 当前 SSH 会话端口，避免把面板/改过端口的 sshd 挤掉
+    if [ -n "${SSH_CLIENT:-}" ]; then
+        local ssh_port
+        ssh_port=$(echo "$SSH_CLIENT" | awk '{print $NF}')
+        [ "$p" = "$ssh_port" ] && return 0
+    fi
+    return 1
+}
+
 port_taken() {
     local p="$1"
+    reserved_port "$p" && return 0
     echo " $USED_PORTS " | grep -q " $p " && return 0
     port_in_use "$p"
+}
+
+# 全量重装前释放旧 inbound，否则 443 会被自己占着
+stop_running_singbox() {
+    info "停止现有 sing-box 以释放端口..."
+    if [ "${OS:-}" = "alpine" ]; then
+        rc-service sing-box stop 2>/dev/null || true
+    else
+        systemctl stop sing-box 2>/dev/null || true
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x sing-box >/dev/null 2>&1 && pkill -x sing-box 2>/dev/null || true
+    fi
+    sleep 1
 }
 
 alloc_port() {
@@ -172,6 +244,10 @@ alloc_port() {
     fi
     if ! is_valid_port "$port"; then
         err "${name} 端口无效: $port"
+        exit 1
+    fi
+    if reserved_port "$port"; then
+        err "${name} 端口 $port 是 SSH 端口，不能占用"
         exit 1
     fi
     if port_taken "$port"; then
@@ -590,7 +666,7 @@ if [ -f /etc/sing-box/config.json ]; then
     echo "3) 退出"
     read -r -p "请选择(默认 1): " reinstall_mode
     case "${reinstall_mode:-1}" in
-        2) KEEP_EXISTING_CONFIG=false ;;
+        2) KEEP_EXISTING_CONFIG=false; stop_running_singbox ;;
         3) info "已取消"; exit 0 ;;
         *) KEEP_EXISTING_CONFIG=true ;;
     esac
@@ -804,7 +880,9 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            # 官方安装脚本可能走 apt，同样禁止 needrestart 重启 ssh
+            NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive \
+                bash <(curl -fsSL https://sing-box.app/install.sh) || {
                 err "sing-box 安装失败"
                 exit 1
             }

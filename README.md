@@ -32,6 +32,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 - 配置用 `jq` 生成，密码里的 `+` `/` 不会写坏 JSON
 - 缓存按 key=value 读取，不会 `source` 执行
 - 已有安装会询问：保留配置只更新 / 全量重装
+- 依赖已齐全时跳过 apt/apk，避免 `needrestart` 重启 sshd 踢掉当前会话
+- 全量重装前先停旧进程，再分配端口；22 / 当前 SSH 端口不会被 inbound 占用
 - 端口校验、去重、占用检测
 - 配置和密钥文件权限收紧
 - IPv6 节点链接自动加 `[]`
