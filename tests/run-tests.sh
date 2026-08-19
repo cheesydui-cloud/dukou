@@ -67,6 +67,14 @@ echo "== format_host =="
 [ "$(format_host 2001:db8::1)" = "[2001:db8::1]" ] && ok "ipv6 host" || bad "ipv6 host"
 [ "$(format_host '[2001:db8::1]')" = "[2001:db8::1]" ] && ok "already-bracket ipv6" || bad "already-bracket ipv6"
 
+echo "== domain helpers =="
+looks_like_domain jp.example.com && ok "domain ok" || bad "domain ok"
+looks_like_domain example.com && ok "apex domain ok" || bad "apex domain ok"
+if looks_like_domain 'not a host'; then bad "invalid domain accepted"; else ok "invalid domain rejected"; fi
+if looks_like_domain 1.2.3.4; then bad "ipv4 treated as domain"; else ok "ipv4 not a domain"; fi
+is_ipv4 1.2.3.4 && ok "is_ipv4" || bad "is_ipv4"
+is_ipv6 2001:db8::1 && ok "is_ipv6" || bad "is_ipv6"
+
 echo "== haversine =="
 dist=$(haversine_km 37.4275 -122.1697 34.0689 -118.4452)
 if [ "$dist" -gt 400 ] && [ "$dist" -lt 600 ]; then
@@ -125,6 +133,17 @@ grep -q 'NEEDRESTART_SUSPEND=1' "$INSTALLER" && ok "needrestart suspended" || ba
 grep -q -- '--no-upgrade' "$INSTALLER" && ok "apt --no-upgrade" || bad "apt --no-upgrade"
 grep -q 'stop_running_singbox' "$INSTALLER" && ok "stop old sing-box before reinstall" || bad "stop old sing-box missing"
 grep -q 'reserved_port' "$INSTALLER" && ok "ssh port reserved" || bad "ssh port reserved"
+grep -q 'backup_existing_install' "$INSTALLER" && ok "reinstall backup" || bad "reinstall backup"
+grep -q 'ask_node_address' "$INSTALLER" && ok "node address prompt" || bad "node address prompt"
+grep -q 'ask_tls_certs' "$INSTALLER" && ok "tls cert prompt" || bad "tls cert prompt"
+grep -q 'issue_acme_cert' "$INSTALLER" && ok "acme helper" || bad "acme helper"
+grep -q 'apply_config' "$INSTALLER" && ok "sb apply_config check" || bad "sb apply_config check"
+grep -q 'action_status' "$INSTALLER" && ok "sb status page" || bad "sb status page"
+grep -q 'action_change_node_host' "$INSTALLER" && ok "sb change node host" || bad "sb change node host"
+grep -q 'REINSTALL_BINARY' "$INSTALLER" && ok "skip binary on keep-config" || bad "skip binary on keep-config"
+grep -q 'sni=\${TLS_SNI' "$INSTALLER" && ok "hy2/tuic uri uses tls sni" || bad "hy2/tuic uri uses tls sni"
+grep -q '/root/singbox-uris.txt' "$INSTALLER" && ok "uri dump to root" || bad "uri dump to root"
+grep -q '不是 Reality SNI' "$INSTALLER" && ok "domain vs reality sni copy" || bad "domain vs reality sni copy"
 grep -q 'load_kv_file' "$INSTALLER" && ok "safe kv loader" || bad "safe kv loader"
 ! grep -q 'addons.mozilla.org' "$INSTALLER" && ok "no mozilla default sni" || bad "mozilla default still present"
 grep -q 'action: "sniff"' "$INSTALLER" && ok "sniff moved to route action" || bad "sniff route action missing"

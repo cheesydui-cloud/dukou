@@ -22,6 +22,23 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 
 可多选，例如 `1 2 4`。
 
+## 自己的域名怎么填
+
+安装时会问「节点对外地址」：
+
+1. 默认用出口 IP
+2. 填已绑定到这台机器的域名，例如 `jp.example.com`
+
+这个域名只出现在客户端链接的 host 里。**不要把它当成 Reality SNI**——Reality dest 仍会探测附近高校/机构。
+
+如果同时选了 Hysteria2 / TUIC，可以再选证书：
+
+1. 自签（默认，`insecure=1`）
+2. 用该域名申请 Let's Encrypt（本机 80 要从外网进来）
+3. 使用已有证书文件
+
+只有 Reality 时不必申请证书。
+
 ## 会自动做的事
 
 - 安装最新 sing-box，并配置 systemd / OpenRC 开机自启
@@ -31,9 +48,12 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 - Reality dest 探测：TLS1.3 + HTTP/2 + 证书 SAN 覆盖 SNI，排除 Cloudflare / Fastly / Cloudfront 等 CDN
 - 配置用 `jq` 生成，密码里的 `+` `/` 不会写坏 JSON
 - 缓存按 key=value 读取，不会 `source` 执行
-- 已有安装会询问：保留配置只更新 / 全量重装
+- 已有安装会询问：保留配置只更新 / 全量重装（全量重装先备份到 `/etc/sing-box/backups/`）
+- 可选填自己的域名作为节点地址，并做 DNS 是否指向本机的提示
+- HY2 / TUIC 可选 Let's Encrypt 或已有证书
 - 依赖已齐全时跳过 apt/apk，避免 `needrestart` 重启 sshd 踢掉当前会话
 - 全量重装前先停旧进程，再分配端口；22 / 当前 SSH 端口不会被 inbound 占用
+- 装完把链接写到 `/root/singbox-uris.txt`
 - 端口校验、去重、占用检测
 - 配置和密钥文件权限收紧
 - IPv6 节点链接自动加 `[]`
@@ -47,7 +67,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 sb
 ```
 
-可以查看链接、改端口、重探 Reality SNI、更换 VLESS UUID / Reality 密钥、更新、卸载，以及生成以本机 SS 为出口的线路机脚本。
+可以查看状态、链接、改端口、改节点域名、重探 Reality SNI、更换 VLESS UUID / Reality 密钥、更新、卸载，以及生成以本机 SS 为出口的线路机脚本。改配置前会先 `sing-box check`。
 
 ## 系统
 

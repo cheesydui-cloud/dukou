@@ -215,6 +215,22 @@ stop_running_singbox() {
     sleep 1
 }
 
+backup_existing_install() {
+    local ts dest
+    [ -f /etc/sing-box/config.json ] || return 0
+    ts=$(date +%Y%m%d-%H%M%S)
+    dest="/etc/sing-box/backups/${ts}"
+    mkdir -p "$dest"
+    cp -a /etc/sing-box/config.json "$dest/" 2>/dev/null || true
+    cp -a /etc/sing-box/.config_cache "$dest/" 2>/dev/null || true
+    cp -a /etc/sing-box/.protocols "$dest/" 2>/dev/null || true
+    cp -a /etc/sing-box/.reality_pub "$dest/" 2>/dev/null || true
+    cp -a /etc/sing-box/.reality_sid "$dest/" 2>/dev/null || true
+    cp -a /root/node_names.txt "$dest/" 2>/dev/null || true
+    [ -d /etc/sing-box/certs ] && cp -a /etc/sing-box/certs "$dest/" 2>/dev/null || true
+    info "已备份现有配置到 $dest"
+}
+
 alloc_port() {
     local name="$1" env_val="${2:-}" default_port="${3:-}" user_val="" port="" i
     local prompt
@@ -267,7 +283,7 @@ load_kv_file() {
         key="${line%%=*}"
         val="${line#*=}"
         case "$key" in
-            ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK)
+            ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK|CERT_MODE|TLS_SNI|TLS_INSECURE)
                 printf -v "$key" '%s' "$val"
                 ;;
         esac
@@ -594,6 +610,215 @@ format_host() {
     fi
 }
 
+is_ipv4() {
+    [[ "${1:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6() {
+    [[ "${1:-}" == *:* && "${1:-}" != *'/'* ]]
+}
+
+looks_like_domain() {
+    local h="${1:-}"
+    is_ipv4 "$h" && return 1
+    is_ipv6 "$h" && return 1
+    [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] &&
+        [[ "$h" =~ [A-Za-z] ]]
+}
+
+list_resolved_ips() {
+    local host="$1" out=""
+    if command -v getent >/dev/null 2>&1; then
+        out=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9a-fA-F:.]+$' | sort -u || true)
+    fi
+    if [ -z "$out" ] && command -v dig >/dev/null 2>&1; then
+        out=$( { dig +short A "$host" 2>/dev/null; dig +short AAAA "$host" 2>/dev/null; } | grep -E '^[0-9a-fA-F:.]+$' | sort -u || true)
+    fi
+    if [ -z "$out" ] && command -v python3 >/dev/null 2>&1; then
+        out=$(python3 - "$host" <<'PY' 2>/dev/null || true
+import socket, sys
+host = sys.argv[1]
+seen = set()
+try:
+    for _fam, _t, _p, _c, addr in socket.getaddrinfo(host, None):
+        ip = addr[0]
+        if ip not in seen:
+            seen.add(ip)
+            print(ip)
+except Exception:
+    pass
+PY
+)
+    fi
+    printf '%s\n' "$out"
+}
+
+list_local_ips() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig 2>/dev/null | awk '/inet /{print $2}' | sed 's/addr://'
+    fi
+}
+
+get_public_ip() {
+    local ip=""
+    for url in \
+        "https://api.ipify.org" \
+        "https://api64.ipify.org" \
+        "https://ipinfo.io/ip" \
+        "https://ifconfig.me" \
+        "https://icanhazip.com" \
+        "https://ipecho.net/plain"; do
+        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" == *:* ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_node_host() {
+    local host="$1" ips pub matched local_ips ip
+    if is_ipv4 "$host" || is_ipv6 "$host"; then
+        info "节点地址使用 IP: $host"
+        return 0
+    fi
+    if ! looks_like_domain "$host"; then
+        warn "看起来不像域名或 IP: $host（仍将写入链接）"
+        return 0
+    fi
+    info "正在解析域名 $host ..."
+    ips=$(list_resolved_ips "$host" | sed '/^$/d')
+    if [ -z "$ips" ]; then
+        warn "暂时无法解析 $host，仍使用该域名作为节点地址"
+        return 0
+    fi
+    info "解析结果: $(printf '%s' "$ips" | tr '\n' ' ')"
+    pub=$(get_public_ip 2>/dev/null || true)
+    local_ips=$(list_local_ips)
+    matched=false
+    if [ -n "$pub" ] && printf '%s\n' "$ips" | grep -Fxq "$pub"; then
+        matched=true
+    fi
+    if ! $matched; then
+        for ip in $ips; do
+            if printf '%s\n' "$local_ips" | grep -Fxq "$ip"; then
+                matched=true
+                break
+            fi
+        done
+    fi
+    if $matched; then
+        info "域名已指向本机"
+    else
+        warn "域名解析未指向本机出口 IP${pub:+ ($pub)}。若走 CDN/中转可忽略"
+    fi
+}
+
+ask_node_address() {
+    CUSTOM_IP="${SINGBOX_NODE_HOST:-${CUSTOM_IP:-}}"
+    CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
+    if [ -n "$CUSTOM_IP" ]; then
+        info "使用指定节点地址: $CUSTOM_IP"
+        validate_node_host "$CUSTOM_IP"
+        return 0
+    fi
+    echo ""
+    echo "节点对外地址（客户端连接用；不是 Reality SNI）:"
+    echo "1) 自动检测出口 IP（默认）"
+    echo "2) 使用已绑定的域名或指定 IP"
+    echo ""
+    echo "Reality 的 SNI/dest 仍会探测附近高校/机构，不要填成自己的域名。"
+    read -r -p "请选择(默认 1): " addr_choice
+    case "${addr_choice:-1}" in
+        2)
+            read -r -p "请输入域名或 IP: " CUSTOM_IP
+            CUSTOM_IP="$(echo "${CUSTOM_IP:-}" | tr -d '[:space:]')"
+            if [ -z "$CUSTOM_IP" ]; then
+                warn "未输入，改为自动检测出口 IP"
+            else
+                validate_node_host "$CUSTOM_IP"
+            fi
+            ;;
+        *)
+            CUSTOM_IP=""
+            ;;
+    esac
+}
+
+ask_tls_certs() {
+    CERT_MODE="${SINGBOX_CERT_MODE:-selfsigned}"
+    TLS_SNI="${TLS_SNI:-www.bing.com}"
+    TLS_INSECURE="${TLS_INSECURE:-1}"
+    if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then
+        CERT_MODE="none"
+        return 0
+    fi
+    if [ -n "${SINGBOX_CERT_MODE:-}" ]; then
+        case "$CERT_MODE" in
+            acme|existing|selfsigned) ;;
+            *) CERT_MODE="selfsigned" ;;
+        esac
+        [ -n "${SINGBOX_TLS_SNI:-}" ] && TLS_SNI="$SINGBOX_TLS_SNI"
+        return 0
+    fi
+    echo ""
+    info "=== HY2 / TUIC 证书 ==="
+    echo "1) 自签证书（默认，客户端 insecure=1，SNI=www.bing.com）"
+    echo "2) 用域名申请 Let's Encrypt（本机 80 需从外网可达）"
+    echo "3) 使用已有证书文件"
+    read -r -p "请选择(默认 1): " cert_choice
+    case "${cert_choice:-1}" in
+        2)
+            CERT_MODE="acme"
+            if looks_like_domain "${CUSTOM_IP:-}"; then
+                TLS_SNI="$CUSTOM_IP"
+            else
+                read -r -p "请输入申请证书的域名: " TLS_SNI
+                TLS_SNI="$(echo "${TLS_SNI:-}" | tr -d '[:space:]')"
+            fi
+            if ! looks_like_domain "$TLS_SNI"; then
+                warn "域名无效，回退自签证书"
+                CERT_MODE="selfsigned"
+                TLS_SNI="www.bing.com"
+                TLS_INSECURE=1
+            else
+                TLS_INSECURE=0
+                info "将为 $TLS_SNI 申请证书"
+            fi
+            ;;
+        3)
+            CERT_MODE="existing"
+            read -r -p "证书 fullchain 路径: " EXISTING_CERT
+            read -r -p "私钥 key 路径: " EXISTING_KEY
+            EXISTING_CERT="$(echo "${EXISTING_CERT:-}" | tr -d '[:space:]')"
+            EXISTING_KEY="$(echo "${EXISTING_KEY:-}" | tr -d '[:space:]')"
+            if [ ! -f "${EXISTING_CERT:-}" ] || [ ! -f "${EXISTING_KEY:-}" ]; then
+                warn "证书文件不存在，回退自签"
+                CERT_MODE="selfsigned"
+                TLS_SNI="www.bing.com"
+                TLS_INSECURE=1
+            else
+                if looks_like_domain "${CUSTOM_IP:-}"; then
+                    TLS_SNI="$CUSTOM_IP"
+                else
+                    read -r -p "证书对应的 SNI 域名: " TLS_SNI
+                    TLS_SNI="$(echo "${TLS_SNI:-}" | tr -d '[:space:]')"
+                fi
+                [ -n "$TLS_SNI" ] || TLS_SNI="www.bing.com"
+                TLS_INSECURE=0
+            fi
+            ;;
+        *)
+            CERT_MODE="selfsigned"
+            TLS_SNI="www.bing.com"
+            TLS_INSECURE=1
+            ;;
+    esac
+}
+
 # -----------------------
 # 选择要部署的协议
 select_protocols() {
@@ -659,16 +884,22 @@ EOF
 mkdir -p /etc/sing-box
 
 KEEP_EXISTING_CONFIG=false
+REINSTALL_BINARY=false
 if [ -f /etc/sing-box/config.json ]; then
     warn "检测到已有 sing-box 配置: /etc/sing-box/config.json"
-    echo "1) 保留现有配置，只更新二进制 / 管理脚本 (推荐)"
-    echo "2) 全量重装（会重新生成端口、密码、UUID、Reality 密钥）"
+    echo "1) 保留现有配置，只更新管理脚本 / 服务 (推荐，不重装二进制)"
+    echo "2) 全量重装（先备份，再重新生成端口、密码、UUID、Reality 密钥）"
     echo "3) 退出"
     read -r -p "请选择(默认 1): " reinstall_mode
     case "${reinstall_mode:-1}" in
-        2) KEEP_EXISTING_CONFIG=false; stop_running_singbox ;;
+        2)
+            KEEP_EXISTING_CONFIG=false
+            REINSTALL_BINARY=true
+            backup_existing_install
+            stop_running_singbox
+            ;;
         3) info "已取消"; exit 0 ;;
-        *) KEEP_EXISTING_CONFIG=true ;;
+        *) KEEP_EXISTING_CONFIG=true; REINSTALL_BINARY=false ;;
     esac
 fi
 
@@ -689,6 +920,9 @@ if $KEEP_EXISTING_CONFIG; then
     suffix="$(cat /root/node_names.txt 2>/dev/null || true)"
     CUSTOM_IP="${CUSTOM_IP:-}"
     REALITY_SNI="${REALITY_SNI:-}"
+    CERT_MODE="${CERT_MODE:-selfsigned}"
+    TLS_SNI="${TLS_SNI:-www.bing.com}"
+    TLS_INSECURE="${TLS_INSECURE:-1}"
     SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
     PORT_SS="${SS_PORT:-}"
     PSK_SS="${SS_PSK:-}"
@@ -744,11 +978,8 @@ if ! $KEEP_EXISTING_CONFIG; then
 select_ss_method
 
 # -----------------------
-# 在获取公网 IP 之前，询问连接ip和sni配置
-echo ""
-echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
-read -r CUSTOM_IP
-CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
+# 节点对外地址（可填自己的域名）；Reality SNI 仍单独探测
+ask_node_address
 
 # 如果用户选择了 Reality 协议，按出口位置探测附近高校/机构 SNI
 REALITY_SNI=""
@@ -853,6 +1084,7 @@ get_config() {
 }
 
 get_config
+ask_tls_certs
 fi
 
 # -----------------------
@@ -862,11 +1094,19 @@ install_singbox() {
 
     if command -v sing-box >/dev/null 2>&1; then
         CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
-        warn "检测到已安装 sing-box: $CURRENT_VERSION"
-        read -p "是否重新安装?(y/N): " REINSTALL
-        if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
-            info "跳过 sing-box 安装"
+        if $KEEP_EXISTING_CONFIG && ! ${REINSTALL_BINARY:-false}; then
+            info "保留现有配置，跳过二进制重装: $CURRENT_VERSION"
             return 0
+        fi
+        if ! ${REINSTALL_BINARY:-false}; then
+            warn "检测到已安装 sing-box: $CURRENT_VERSION"
+            read -r -p "是否重新安装二进制?(y/N): " REINSTALL
+            if [[ ! "${REINSTALL:-}" =~ ^[Yy]$ ]]; then
+                info "跳过 sing-box 安装"
+                return 0
+            fi
+        else
+            info "全量重装，将更新 sing-box 二进制（当前: $CURRENT_VERSION）"
         fi
     fi
 
@@ -949,29 +1189,90 @@ generate_reality_keys
 fi
 
 # -----------------------
-# 生成 HY2/TUIC 自签证书(仅在需要时)
+# 生成 HY2/TUIC 证书
+issue_acme_cert() {
+    local domain="$1"
+    local email
+    email="admin@${domain}"
+    mkdir -p /etc/sing-box/certs
+    if ! command -v acme.sh >/dev/null 2>&1 && [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
+        curl -fsSL https://get.acme.sh | sh -s email="$email" || return 1
+    fi
+    local acme="$HOME/.acme.sh/acme.sh"
+    [ -x "$acme" ] || acme=$(command -v acme.sh)
+    [ -n "$acme" ] || return 1
+    "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    if ! "$acme" --issue -d "$domain" --standalone --httpport 80 --force; then
+        return 1
+    fi
+    "$acme" --install-cert -d "$domain" \
+        --fullchain-file /etc/sing-box/certs/fullchain.pem \
+        --key-file /etc/sing-box/certs/privkey.pem \
+        --reloadcmd "true" || return 1
+    chmod 640 /etc/sing-box/certs/fullchain.pem /etc/sing-box/certs/privkey.pem
+    return 0
+}
+
+write_selfsigned_cert() {
+    local cn="${1:-www.bing.com}"
+    mkdir -p /etc/sing-box/certs
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -keyout /etc/sing-box/certs/privkey.pem \
+      -out /etc/sing-box/certs/fullchain.pem \
+      -days 3650 \
+      -subj "/CN=${cn}" || return 1
+    chmod 640 /etc/sing-box/certs/fullchain.pem /etc/sing-box/certs/privkey.pem
+}
+
 generate_cert() {
     if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then
         info "跳过证书生成(未选择 HY2 或 TUIC)"
+        CERT_MODE="none"
         return 0
     fi
-    
-    info "生成 HY2/TUIC 自签证书..."
+
     mkdir -p /etc/sing-box/certs
-    
-    if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-          -keyout /etc/sing-box/certs/privkey.pem \
-          -out /etc/sing-box/certs/fullchain.pem \
-          -days 3650 \
-          -subj "/CN=www.bing.com" || {
-            err "证书生成失败"
-            exit 1
-        }
-        info "证书已生成"
-    else
-        info "证书已存在"
-    fi
+    CERT_MODE="${CERT_MODE:-selfsigned}"
+    TLS_SNI="${TLS_SNI:-www.bing.com}"
+    TLS_INSECURE="${TLS_INSECURE:-1}"
+
+    case "$CERT_MODE" in
+        existing)
+            info "使用已有证书: $EXISTING_CERT"
+            cp -f "$EXISTING_CERT" /etc/sing-box/certs/fullchain.pem
+            cp -f "$EXISTING_KEY" /etc/sing-box/certs/privkey.pem
+            chmod 640 /etc/sing-box/certs/fullchain.pem /etc/sing-box/certs/privkey.pem
+            TLS_INSECURE=0
+            ;;
+        acme)
+            info "正在为 $TLS_SNI 申请 Let's Encrypt 证书（占用 80 端口）..."
+            if port_in_use 80; then
+                warn "80 端口已被占用，ACME HTTP-01 可能失败"
+            fi
+            if issue_acme_cert "$TLS_SNI"; then
+                info "证书申请成功: $TLS_SNI"
+                TLS_INSECURE=0
+            else
+                warn "ACME 失败，回退自签证书（客户端仍需 insecure=1）"
+                CERT_MODE="selfsigned"
+                TLS_SNI="www.bing.com"
+                TLS_INSECURE=1
+                write_selfsigned_cert "$TLS_SNI" || { err "证书生成失败"; exit 1; }
+            fi
+            ;;
+        *)
+            CERT_MODE="selfsigned"
+            TLS_SNI="www.bing.com"
+            TLS_INSECURE=1
+            if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
+                info "生成 HY2/TUIC 自签证书..."
+                write_selfsigned_cert "$TLS_SNI" || { err "证书生成失败"; exit 1; }
+                info "证书已生成"
+            else
+                info "证书已存在"
+            fi
+            ;;
+    esac
 }
 
 if ! $KEEP_EXISTING_CONFIG; then
@@ -1008,6 +1309,7 @@ create_config() {
         inbounds=$(jq -c \
             --argjson port "$PORT_HY2" \
             --arg password "$PSK_HY2" \
+            --arg masq "https://${TLS_SNI:-www.bing.com}" \
             '. + [{
               type: "hysteria2",
               tag: "hy2-in",
@@ -1015,7 +1317,7 @@ create_config() {
               listen_port: $port,
               users: [{password: $password}],
               ignore_client_bandwidth: true,
-              masquerade: "https://www.bing.com",
+              masquerade: $masq,
               tls: {
                 enabled: true,
                 alpn: ["h3"],
@@ -1144,6 +1446,12 @@ CACHEEOF
 TUIC_PORT=$PORT_TUIC
 TUIC_UUID=$UUID_TUIC
 TUIC_PSK=$PSK_TUIC
+CACHEEOF
+
+    cat >> /etc/sing-box/.config_cache <<CACHEEOF
+CERT_MODE=${CERT_MODE:-none}
+TLS_SNI=${TLS_SNI:-www.bing.com}
+TLS_INSECURE=${TLS_INSECURE:-1}
 CACHEEOF
 
     $ENABLE_REALITY && cat >> /etc/sing-box/.config_cache <<CACHEEOF
@@ -1358,26 +1666,6 @@ print_firewall_hint() {
 setup_service
 enable_bbr
 
-# -----------------------
-# 获取公网 IP
-get_public_ip() {
-    local ip=""
-    for url in \
-        "https://api.ipify.org" \
-        "https://api64.ipify.org" \
-        "https://ipinfo.io/ip" \
-        "https://ifconfig.me" \
-        "https://icanhazip.com" \
-        "https://ipecho.net/plain"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" == *:* ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    return 1
-}
-
 # 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
 if [ -n "${CUSTOM_IP:-}" ]; then
     PUB_IP="$CUSTOM_IP"
@@ -1409,14 +1697,14 @@ generate_uris() {
     if $ENABLE_HY2; then
         hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
+        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=${TLS_SNI:-www.bing.com}&alpn=h3&insecure=${TLS_INSECURE:-1}#hy2${suffix}"
         echo ""
     fi
 
     if $ENABLE_TUIC; then
         tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
         echo "=== TUIC ==="
-        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
+        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=${TLS_SNI:-www.bing.com}&insecure=${TLS_INSECURE:-1}#tuic${suffix}"
         echo ""
     fi
     
@@ -1452,16 +1740,21 @@ $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 
         echo "   Reality server_name(SNI): $REALITY_SNI"
         [ -n "${REALITY_SNI_REASON:-}" ] && echo "   SNI 来源: $REALITY_SNI_REASON"
     fi
+    if $ENABLE_HY2 || $ENABLE_TUIC; then
+        echo "   HY2/TUIC 证书: ${CERT_MODE:-selfsigned} | SNI=${TLS_SNI:-www.bing.com} | insecure=${TLS_INSECURE:-1}"
+    fi
 echo ""
 info "📂 文件位置:"
 echo "   配置: $CONFIG_PATH"
 ($ENABLE_HY2 || $ENABLE_TUIC) && echo "   证书: /etc/sing-box/certs/"
 echo "   服务: $SERVICE_PATH"
+echo "   链接备份: /root/singbox-uris.txt"
 echo ""
 info "📜 客户端链接:"
-generate_uris | while IFS= read -r line; do
+generate_uris | tee /root/singbox-uris.txt | while IFS= read -r line; do
     echo "   $line"
 done
+chmod 600 /root/singbox-uris.txt 2>/dev/null || true
 echo ""
 info "🔧 管理命令:"
 if [ "$OS" = "alpine" ]; then
@@ -1580,7 +1873,7 @@ read_config() {
             key="${line%%=*}"
             val="${line#*=}"
             case "$key" in
-                ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK)
+                ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK|CERT_MODE|TLS_SNI|TLS_INSECURE)
                     printf -v "$key" '%s' "$val"
                     ;;
             esac
@@ -1612,6 +1905,9 @@ read_config() {
     REALITY_SNI="${REALITY_SNI:-}"
     ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
     CUSTOM_IP="${CUSTOM_IP:-}"
+    CERT_MODE="${CERT_MODE:-selfsigned}"
+    TLS_SNI="${TLS_SNI:-www.bing.com}"
+    TLS_INSECURE="${TLS_INSECURE:-1}"
 
     if [ -z "$REALITY_SNI" ] && [ -f "$CONFIG_PATH" ]; then
         REALITY_SNI=$(jq -r '
@@ -1722,14 +2018,14 @@ generate_uris() {
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         hy2_encoded=$(url_encode "$HY2_PSK")
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
-        echo "hy2://${hy2_encoded}@${PUBLIC_HOST}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
+        echo "hy2://${hy2_encoded}@${PUBLIC_HOST}:${HY2_PORT}/?sni=${TLS_SNI:-www.bing.com}&alpn=h3&insecure=${TLS_INSECURE:-1}#hy2${node_suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
     
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
         tuic_encoded=$(url_encode "$TUIC_PSK")
         echo "=== TUIC ===" >> "$URI_FILE"
-        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_HOST}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${node_suffix}" >> "$URI_FILE"
+        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_HOST}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=${TLS_SNI:-www.bing.com}&insecure=${TLS_INSECURE:-1}#tuic${node_suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
     
@@ -1748,7 +2044,30 @@ generate_uris() {
     fi
 
     chmod 600 "$URI_FILE" 2>/dev/null || true
+    cp -f "$URI_FILE" /root/singbox-uris.txt 2>/dev/null || true
+    chmod 600 /root/singbox-uris.txt 2>/dev/null || true
     info "URI 已保存到: $URI_FILE"
+}
+
+apply_config() {
+    local new_cfg="$1"
+    if [ ! -f "$new_cfg" ]; then
+        err "新配置不存在: $new_cfg"
+        return 1
+    fi
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "$new_cfg" >/dev/null 2>&1; then
+            err "配置校验失败，未重启服务"
+            sing-box check -c "$new_cfg" || true
+            rm -f "$new_cfg"
+            return 1
+        fi
+    fi
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    mv "$new_cfg" "$CONFIG_PATH"
+    chown sing-box:sing-box "$CONFIG_PATH" 2>/dev/null || true
+    chmod 640 "$CONFIG_PATH" 2>/dev/null || true
+    service_restart || warn "重启失败"
 }
 
 # 查看URI
@@ -1780,8 +2099,48 @@ action_edit_config() {
             generate_uris || true
         else
             warn "配置校验失败,服务未重启"
+            if [ -f "${CONFIG_PATH}.bak" ]; then
+                warn "可手动恢复: cp ${CONFIG_PATH}.bak $CONFIG_PATH"
+            fi
         fi
     fi
+}
+
+action_status() {
+    read_config || true
+    echo ""
+    echo "========== 运行状态 =========="
+    if command -v sing-box >/dev/null 2>&1; then
+        echo "版本: $(sing-box version 2>/dev/null | head -n1)"
+    else
+        echo "版本: 未找到 sing-box"
+    fi
+    if [ "$OS" = "alpine" ]; then
+        rc-service "$SERVICE_NAME" status 2>/dev/null || true
+    else
+        systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1 && echo "服务: active" || echo "服务: inactive"
+        systemctl --no-pager -n 8 status "$SERVICE_NAME" 2>/dev/null | sed -n '1,12p' || true
+    fi
+    echo "节点地址: ${CUSTOM_IP:-自动检测}"
+    echo "BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown) / qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    [ "${ENABLE_SS:-false}" = "true" ] && echo "SS: ${SS_PORT} ${SS_METHOD}"
+    [ "${ENABLE_HY2:-false}" = "true" ] && echo "HY2: ${HY2_PORT} sni=${TLS_SNI:-www.bing.com} insecure=${TLS_INSECURE:-1} cert=${CERT_MODE}"
+    [ "${ENABLE_TUIC:-false}" = "true" ] && echo "TUIC: ${TUIC_PORT} sni=${TLS_SNI:-www.bing.com} insecure=${TLS_INSECURE:-1} cert=${CERT_MODE}"
+    [ "${ENABLE_REALITY:-false}" = "true" ] && echo "VLESS Reality: ${REALITY_PORT} sni=${REALITY_SNI}"
+    [ "${ENABLE_ANYTLS:-false}" = "true" ] && echo "AnyTLS Reality: ${ANYTLS_PORT} sni=${REALITY_SNI}"
+    echo "=============================="
+}
+
+action_change_node_host() {
+    read_config || return 1
+    echo "当前节点地址: ${CUSTOM_IP:-自动检测出口 IP}"
+    echo "这只影响客户端链接里的 host，不会改 Reality SNI。"
+    read -r -p "输入新的域名或 IP（留空=自动检测）: " new_host
+    new_host="$(echo "${new_host:-}" | tr -d '[:space:]')"
+    cache_set "$CACHE_FILE" CUSTOM_IP "$new_host"
+    CUSTOM_IP="$new_host"
+    info "已更新节点地址: ${CUSTOM_IP:-自动检测}"
+    generate_uris || warn "生成 URI 失败"
 }
 
 # 重置SS端口
@@ -1794,19 +2153,11 @@ action_reset_ss() {
     fi
     
     new_port=$(ask_new_port "$SS_PORT" "SS") || return 1
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
     jq --argjson port "$new_port" '
     .inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 SS 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
+    info "已更新 SS 端口: $new_port"
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1820,19 +2171,11 @@ action_reset_hy2() {
     fi
     
     new_port=$(ask_new_port "$HY2_PORT" "HY2") || return 1
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
     jq --argjson port "$new_port" '
     .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 HY2 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
+    info "已更新 HY2 端口: $new_port"
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1846,19 +2189,11 @@ action_reset_tuic() {
     fi
     
     new_port=$(ask_new_port "$TUIC_PORT" "TUIC") || return 1
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
     jq --argjson port "$new_port" '
     .inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 TUIC 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
+    info "已更新 TUIC 端口: $new_port"
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1872,19 +2207,11 @@ action_reset_reality() {
     fi
     
     new_port=$(ask_new_port "$REALITY_PORT" "VLESS Reality") || return 1
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
     jq --argjson port "$new_port" '
     .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 Vless Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
+    info "已更新 Vless Reality 端口: $new_port"
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1898,19 +2225,11 @@ action_reset_anytls() {
     fi
 
     new_port=$(ask_new_port "$ANYTLS_PORT" "AnyTLS Reality") || return 1
-
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
     jq --argjson port "$new_port" '
     .inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
-    info "已启动服务并更新 AnyTLS Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
+    info "已更新 AnyTLS Reality 端口: $new_port"
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1959,10 +2278,6 @@ action_change_sni() {
         [ -z "$new_sni" ] && info "已取消" && return 0
     fi
 
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
     jq --arg sni "$new_sni" '
       .inbounds |= map(
         if (.tls.reality.enabled == true) then
@@ -1970,13 +2285,10 @@ action_change_sni() {
           | .tls.reality.handshake.server = $sni
         else . end
       )
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
     cache_set "$CACHE_FILE" REALITY_SNI "$new_sni"
-
     info "已更新 Reality SNI: $new_sni"
-    service_start || warn "启动服务失败"
-    sleep 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -1989,16 +2301,12 @@ action_rotate_uuid() {
     local new_uuid
     new_uuid=$(rand_uuid)
     info "正在更换 VLESS UUID..."
-    service_stop || warn "停止服务失败"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     jq --arg uuid "$new_uuid" '
       .inbounds |= map(if .type=="vless" then .users[0].uuid = $uuid else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
     cache_set "$CACHE_FILE" REALITY_UUID "$new_uuid"
-    chown sing-box:sing-box "$CONFIG_PATH" 2>/dev/null || true
     info "新 UUID: $new_uuid"
-    service_start || warn "启动服务失败"
-    sleep 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2020,8 +2328,6 @@ action_rotate_reality_keys() {
     sid=$(sing-box generate rand 8 --hex) || { err "生成 ShortID 失败"; return 1; }
     [ -n "$pk" ] && [ -n "$pub" ] && [ -n "$sid" ] || { err "密钥为空"; return 1; }
 
-    service_stop || warn "停止服务失败"
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     jq --arg pk "$pk" --arg sid "$sid" '
       .inbounds |= map(
         if (.tls.reality.enabled == true) then
@@ -2029,17 +2335,16 @@ action_rotate_reality_keys() {
           | .tls.reality.short_id = [$sid]
         else . end
       )
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" || return 1
+    apply_config "${CONFIG_PATH}.tmp" || return 1
     printf '%s' "$pub" > /etc/sing-box/.reality_pub
     printf '%s' "$sid" > /etc/sing-box/.reality_sid
     chmod 600 /etc/sing-box/.reality_pub /etc/sing-box/.reality_sid
-    chown sing-box:sing-box "$CONFIG_PATH" /etc/sing-box/.reality_pub /etc/sing-box/.reality_sid 2>/dev/null || true
+    chown sing-box:sing-box /etc/sing-box/.reality_pub /etc/sing-box/.reality_sid 2>/dev/null || true
     cache_set "$CACHE_FILE" REALITY_PK "$pk"
     cache_set "$CACHE_FILE" REALITY_PUB "$pub"
     cache_set "$CACHE_FILE" REALITY_SID "$sid"
     info "Reality 公钥已更新: $pub"
-    service_start || warn "启动服务失败"
-    sleep 1
     generate_uris || warn "生成 URI 失败"
 }
 
@@ -2086,7 +2391,7 @@ action_uninstall() {
     fi
     rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sb \
         /usr/bin/sing-box /usr/local/bin/sing-box /usr/local/lib/singbox-yyds \
-        /root/node_names.txt /etc/sysctl.d/99-singbox-bbr.conf \
+        /root/node_names.txt /root/singbox-uris.txt /etc/sysctl.d/99-singbox-bbr.conf \
         /etc/sysctl.d/99-singbox-udp.conf 2>/dev/null || true
     info "卸载完成"
 }
@@ -2391,6 +2696,10 @@ MENU
         option=$((option + 1))
     fi
 
+    echo "$option) 更改节点域名/IP（不影响 Reality SNI）"
+    MENU_MAP[$option]="change_host"
+    option=$((option + 1))
+
     # 固定功能选项
     MENU_MAP[$option]="start"
     echo "$option) 启动服务"
@@ -2452,10 +2761,11 @@ while true; do
                 change_sni) action_change_sni ;;
                 rotate_uuid) action_rotate_uuid ;;
                 rotate_keys) action_rotate_reality_keys ;;
+                change_host) action_change_node_host ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
-                status) service_status ;;
+                status) action_status ;;
                 update) action_update ;;
                 relay) action_generate_relay ;;
                 uninstall) action_uninstall; exit 0 ;;
