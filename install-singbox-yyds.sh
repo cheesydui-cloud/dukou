@@ -72,7 +72,7 @@ install_deps() {
     case "$OS" in
         alpine)
             apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq iproute2 || {
+            apk add --no-cache bash curl ca-certificates openssl openrc jq iproute2 libcap || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -80,19 +80,19 @@ install_deps() {
         debian)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq iproute2 || {
+            apt-get install -y curl ca-certificates openssl jq iproute2 libcap2-bin || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl ca-certificates openssl jq iproute || {
+                dnf install -y curl ca-certificates openssl jq iproute libcap || {
                     err "依赖安装失败"
                     exit 1
                 }
             else
-                yum install -y curl ca-certificates openssl jq iproute || {
+                yum install -y curl ca-certificates openssl jq iproute libcap || {
                     err "依赖安装失败"
                     exit 1
                 }
@@ -144,19 +144,30 @@ port_taken() {
 }
 
 alloc_port() {
-    local name="$1" env_val="${2:-}" user_val="" port="" i
+    local name="$1" env_val="${2:-}" default_port="${3:-}" user_val="" port="" i
+    local prompt
+    if [ -n "$default_port" ]; then
+        prompt="请输入 ${name} 端口(留空默认 ${default_port}): "
+    else
+        prompt="请输入 ${name} 端口(留空则随机 10000-60000): "
+    fi
     if [ -n "$env_val" ]; then
         port="$env_val"
     else
-        read -r -p "请输入 ${name} 端口(留空则随机 10000-60000): " user_val
+        read -r -p "$prompt" user_val
         port="${user_val:-}"
     fi
     if [ -z "$port" ]; then
-        for i in $(seq 1 30); do
-            port=$(rand_port)
-            port_taken "$port" || break
-            port=""
-        done
+        if [ -n "$default_port" ] && ! port_taken "$default_port"; then
+            port="$default_port"
+        else
+            [ -n "$default_port" ] && warn "${name} 默认端口 ${default_port} 已被占用，改为随机端口"
+            for i in $(seq 1 30); do
+                port=$(rand_port)
+                port_taken "$port" || break
+                port=""
+            done
+        fi
         [ -n "$port" ] || { err "无法分配空闲端口"; exit 1; }
     fi
     if ! is_valid_port "$port"; then
@@ -169,6 +180,38 @@ alloc_port() {
     fi
     mark_port "$port"
     echo "$port"
+}
+
+load_kv_file() {
+    local file="$1"
+    local line key val
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK)
+                printf -v "$key" '%s' "$val"
+                ;;
+        esac
+    done < "$file"
+}
+
+cache_set() {
+    local file="$1" key="$2" val="$3"
+    local tmp
+    tmp=$(mktemp 2>/dev/null || echo "/tmp/cache_set.$$")
+    if [ -f "$file" ]; then
+        awk -v k="$key" -v v="$val" '
+            BEGIN { found=0 }
+            index($0, k"=")==1 { print k"="v; found=1; next }
+            { print }
+            END { if (!found) print k"="v }
+        ' "$file" > "$tmp" && mv "$tmp" "$file"
+    else
+        printf '%s=%s\n' "$key" "$val" > "$file"
+    fi
 }
 
 # 生成随机密码
@@ -305,32 +348,70 @@ lookup_server_geo() {
     [ -n "$GEO_LAT" ] && [ -n "$GEO_LON" ]
 }
 
-# 探测站点是否适合做 Reality dest：TLS1.3 + HTTP/2，且尽量不是 Cloudflare 壳
+# 探测站点是否适合做 Reality dest：TLS1.3 + HTTP/2，证书 SAN 覆盖 SNI，排除常见 CDN
 probe_reality_dest() {
     local host="$1"
-    local out headers code ver tms rest
+    local out headers code ver tms rest san_ok tls_ok
+    local tmp_body tmp_err
+    tmp_body=$(mktemp 2>/dev/null || echo "/tmp/reality_body.$$")
+    tmp_err=$(mktemp 2>/dev/null || echo "/tmp/reality_err.$$")
 
-    headers=$(curl -sSI --connect-timeout 4 --max-time 8 --tlsv1.3 --http2 \
-        "https://${host}/" 2>/dev/null || true)
-    if printf '%s' "$headers" | grep -Eiq '^[Ss]erver:[[:space:]]*cloudflare|[[:space:]]cf-ray:'; then
+    local curl_opts=(--connect-timeout 4 --max-time 8)
+    # 部分系统 curl 文档里有 --tlsv1.3，但编出来没有；TLS1.3 改由 openssl 校验
+    if curl -V 2>/dev/null | grep -qi http2; then
+        curl_opts+=(--http2)
+    fi
+
+    headers=$(curl -sSI "${curl_opts[@]}" "https://${host}/" 2>/dev/null || true)
+    if printf '%s' "$headers" | grep -Eiq \
+        '^[Ss]erver:[[:space:]]*(cloudflare|cloudfront|akamai|gws|gse|fastly|sucuri|incapsula)|[[:space:]]cf-ray:|[[:space:]]x-amz-cf-id:|[[:space:]]x-cache:[[:space:]].*cloudfront|[[:space:]]x-served-by:[[:space:]]*cache-|[[:space:]]x-fastly-request-id:'; then
+        rm -f "$tmp_body" "$tmp_err"
         return 1
     fi
 
-    out=$(curl -sS -o /dev/null --connect-timeout 4 --max-time 8 \
-        --tlsv1.3 --http2 \
-        -w '%{http_code}|%{http_version}|%{time_appconnect}' \
-        "https://${host}/" 2>/dev/null) || return 1
+    out=$(curl -sS -o "$tmp_body" "${curl_opts[@]}" \
+        -w '%{http_code}|%{http_version}|%{ssl_verify_result}|%{time_appconnect}' \
+        "https://${host}/" 2>"$tmp_err") || {
+        rm -f "$tmp_body" "$tmp_err"
+        return 1
+    }
 
     code="${out%%|*}"
     rest="${out#*|}"
     ver="${rest%%|*}"
+    rest="${rest#*|}"
+    local verify="${rest%%|*}"
     tms="${rest#*|}"
 
-    [ -z "$code" ] || [ "$code" = "000" ] && return 1
+    rm -f "$tmp_body"
+    [ -z "$code" ] || [ "$code" = "000" ] && { rm -f "$tmp_err"; return 1; }
+    [ "$verify" = "0" ] || { rm -f "$tmp_err"; return 1; }
     case "$ver" in
         2|2.0) ;;
-        *) return 1 ;;
+        *) rm -f "$tmp_err"; return 1 ;;
     esac
+
+    san_ok=0
+    tls_ok=0
+    if command -v openssl >/dev/null 2>&1; then
+        local handshake cert names cn
+        handshake=$(echo | openssl s_client -servername "$host" -connect "${host}:443" -tls1_3 2>/dev/null || true)
+        printf '%s' "$handshake" | grep -Eq 'Protocol[[:space:]]*:[[:space:]]*TLSv1\.3' && tls_ok=1
+        cert=$(printf '%s' "$handshake" | openssl x509 -noout -text -subject 2>/dev/null || true)
+        names=$(printf '%s' "$cert" | tr ',' '\n' | sed -n 's/.*DNS:[[:space:]]*//p' | tr -d ' ')
+        cn=$(printf '%s' "$cert" | sed -n 's/.*CN[=[:space:]]*//p' | head -n1 | cut -d'/' -f1 | tr -d ' ')
+        if printf '%s\n' "$names" "$cn" | grep -Fxq "$host"; then
+            san_ok=1
+        elif printf '%s\n' "$names" | grep -Eq "^\*\.${host#*.}$" && [[ "$host" == *.* ]]; then
+            san_ok=1
+        fi
+    else
+        san_ok=1
+        tls_ok=1
+    fi
+    rm -f "$tmp_err"
+    [ "$tls_ok" = "1" ] || return 1
+    [ "$san_ok" = "1" ] || return 1
 
     awk -v t="$tms" 'BEGIN{
         if (t+0 <= 0) exit 1
@@ -438,17 +519,6 @@ format_host() {
 }
 
 # -----------------------
-# 配置节点名称后缀
-echo "请输入节点名称(留空则使用默认协议名):"
-read -r user_name
-if [[ -n "$user_name" ]]; then
-    suffix="-${user_name}"
-    echo "$suffix" > /root/node_names.txt
-else
-    suffix=""
-fi
-
-# -----------------------
 # 选择要部署的协议
 select_protocols() {
     info "=== 选择要部署的协议 ==="
@@ -511,7 +581,60 @@ EOF
 
 # 创建配置目录
 mkdir -p /etc/sing-box
-select_protocols
+
+KEEP_EXISTING_CONFIG=false
+if [ -f /etc/sing-box/config.json ]; then
+    warn "检测到已有 sing-box 配置: /etc/sing-box/config.json"
+    echo "1) 保留现有配置，只更新二进制 / 管理脚本 (推荐)"
+    echo "2) 全量重装（会重新生成端口、密码、UUID、Reality 密钥）"
+    echo "3) 退出"
+    read -r -p "请选择(默认 1): " reinstall_mode
+    case "${reinstall_mode:-1}" in
+        2) KEEP_EXISTING_CONFIG=false ;;
+        3) info "已取消"; exit 0 ;;
+        *) KEEP_EXISTING_CONFIG=true ;;
+    esac
+fi
+
+if $KEEP_EXISTING_CONFIG; then
+    info "保留现有节点配置，仅更新程序与管理面板"
+    ENABLE_SS=false
+    ENABLE_HY2=false
+    ENABLE_TUIC=false
+    ENABLE_REALITY=false
+    ENABLE_ANYTLS=false
+    load_kv_file /etc/sing-box/.protocols
+    load_kv_file /etc/sing-box/.config_cache
+    [ -n "${SS_PORT:-}" ] && ENABLE_SS=true
+    [ -n "${HY2_PORT:-}" ] && ENABLE_HY2=true
+    [ -n "${TUIC_PORT:-}" ] && ENABLE_TUIC=true
+    [ -n "${REALITY_PORT:-}" ] && ENABLE_REALITY=true
+    [ -n "${ANYTLS_PORT:-}" ] && ENABLE_ANYTLS=true
+    suffix="$(cat /root/node_names.txt 2>/dev/null || true)"
+    CUSTOM_IP="${CUSTOM_IP:-}"
+    REALITY_SNI="${REALITY_SNI:-}"
+    SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
+    PORT_SS="${SS_PORT:-}"
+    PSK_SS="${SS_PSK:-}"
+    PORT_HY2="${HY2_PORT:-}"
+    PSK_HY2="${HY2_PSK:-}"
+    PORT_TUIC="${TUIC_PORT:-}"
+    UUID_TUIC="${TUIC_UUID:-}"
+    PSK_TUIC="${TUIC_PSK:-}"
+    PORT_REALITY="${REALITY_PORT:-}"
+    UUID="${REALITY_UUID:-}"
+    PORT_ANYTLS="${ANYTLS_PORT:-}"
+else
+    echo "请输入节点名称(留空则使用默认协议名):"
+    read -r user_name
+    if [[ -n "$user_name" ]]; then
+        suffix="-${user_name}"
+        echo "$suffix" > /root/node_names.txt
+    else
+        suffix=""
+    fi
+    select_protocols
+fi
 
 # -----------------------
 # 选择SS加密方式（新增）
@@ -541,6 +664,7 @@ select_ss_method() {
     export SS_METHOD
 }
 
+if ! $KEEP_EXISTING_CONFIG; then
 select_ss_method
 
 # -----------------------
@@ -629,7 +753,7 @@ get_config() {
 
     if $ENABLE_REALITY; then
         info "=== 配置 VLESS Reality ==="
-        PORT_REALITY=$(alloc_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-}")
+        PORT_REALITY=$(alloc_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-}" "443")
         UUID=$(rand_uuid)
         info "VLESS Reality 端口: $PORT_REALITY"
         info "VLESS Reality UUID 已自动生成"
@@ -637,7 +761,11 @@ get_config() {
     
     if $ENABLE_ANYTLS; then
         info "=== 配置 AnyTLS Reality ==="
-        PORT_ANYTLS=$(alloc_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}")
+        if $ENABLE_REALITY; then
+            PORT_ANYTLS=$(alloc_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}")
+        else
+            PORT_ANYTLS=$(alloc_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}" "443")
+        fi
         ANYTLS_USER=$(openssl rand -hex 4)
         ANYTLS_PSK=$(openssl rand -base64 16)
         info "AnyTLS Reality 端口: $PORT_ANYTLS"
@@ -649,6 +777,7 @@ get_config() {
 }
 
 get_config
+fi
 
 # -----------------------
 # 安装 sing-box
@@ -737,7 +866,9 @@ generate_reality_keys() {
     info "Reality 密钥已生成"
 }
 
+if ! $KEEP_EXISTING_CONFIG; then
 generate_reality_keys
+fi
 
 # -----------------------
 # 生成 HY2/TUIC 自签证书(仅在需要时)
@@ -765,7 +896,9 @@ generate_cert() {
     fi
 }
 
+if ! $KEEP_EXISTING_CONFIG; then
 generate_cert
+fi
 
 # -----------------------
 # 生成配置文件
@@ -775,199 +908,127 @@ create_config() {
     info "生成配置文件: $CONFIG_PATH"
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
+    local inbounds
+    inbounds='[]'
 
-    # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$$.json"
-    > "$TEMP_INBOUNDS"
-    
-    local need_comma=false
-    
     if $ENABLE_SS; then
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_SS'
-    {
-      "type": "shadowsocks",
-      "listen": "::",
-      "listen_port": PORT_SS_PLACEHOLDER,
-      "method": "METHOD_SS_PLACEHOLDER",
-      "password": "PSK_SS_PLACEHOLDER",
-      "tag": "ss-in"
-    }
-INBOUND_SS
-        sed -i "s|PORT_SS_PLACEHOLDER|$PORT_SS|g" "$TEMP_INBOUNDS"
-        sed -i "s|METHOD_SS_PLACEHOLDER|$SS_METHOD|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_SS_PLACEHOLDER|$PSK_SS|g" "$TEMP_INBOUNDS"
-        need_comma=true
+        inbounds=$(jq -c \
+            --argjson port "$PORT_SS" \
+            --arg method "$SS_METHOD" \
+            --arg password "$PSK_SS" \
+            '. + [{
+              type: "shadowsocks",
+              listen: "::",
+              listen_port: $port,
+              method: $method,
+              password: $password,
+              tag: "ss-in"
+            }]' <<<"$inbounds")
     fi
-    
+
     if $ENABLE_HY2; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_HY2'
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": PORT_HY2_PLACEHOLDER,
-      "users": [
-        {
-          "password": "PSK_HY2_PLACEHOLDER"
-        }
-      ],
-      "ignore_client_bandwidth": true,
-      "masquerade": "https://www.bing.com",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
-        "key_path": "/etc/sing-box/certs/privkey.pem"
-      }
-    }
-INBOUND_HY2
-        sed -i "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" "$TEMP_INBOUNDS"
-        need_comma=true
+        inbounds=$(jq -c \
+            --argjson port "$PORT_HY2" \
+            --arg password "$PSK_HY2" \
+            '. + [{
+              type: "hysteria2",
+              tag: "hy2-in",
+              listen: "::",
+              listen_port: $port,
+              users: [{password: $password}],
+              ignore_client_bandwidth: true,
+              masquerade: "https://www.bing.com",
+              tls: {
+                enabled: true,
+                alpn: ["h3"],
+                certificate_path: "/etc/sing-box/certs/fullchain.pem",
+                key_path: "/etc/sing-box/certs/privkey.pem"
+              }
+            }]' <<<"$inbounds")
     fi
-    
+
     if $ENABLE_TUIC; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_TUIC'
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": PORT_TUIC_PLACEHOLDER,
-      "users": [
-        {
-          "uuid": "UUID_TUIC_PLACEHOLDER",
-          "password": "PSK_TUIC_PLACEHOLDER"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
-        "key_path": "/etc/sing-box/certs/privkey.pem"
-      }
-    }
-INBOUND_TUIC
-        sed -i "s|PORT_TUIC_PLACEHOLDER|$PORT_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_TUIC_PLACEHOLDER|$UUID_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_TUIC_PLACEHOLDER|$PSK_TUIC|g" "$TEMP_INBOUNDS"
-        need_comma=true
+        inbounds=$(jq -c \
+            --argjson port "$PORT_TUIC" \
+            --arg uuid "$UUID_TUIC" \
+            --arg password "$PSK_TUIC" \
+            '. + [{
+              type: "tuic",
+              tag: "tuic-in",
+              listen: "::",
+              listen_port: $port,
+              users: [{uuid: $uuid, password: $password}],
+              congestion_control: "bbr",
+              tls: {
+                enabled: true,
+                alpn: ["h3"],
+                certificate_path: "/etc/sing-box/certs/fullchain.pem",
+                key_path: "/etc/sing-box/certs/privkey.pem"
+              }
+            }]' <<<"$inbounds")
     fi
-    
+
     if $ENABLE_REALITY; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_REALITY'
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": PORT_REALITY_PLACEHOLDER,
-      "sniff": true,
-      "tcp_fast_open": true,
-      "users": [
-        {
-          "uuid": "UUID_REALITY_PLACEHOLDER",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "REALITY_SNI_PLACEHOLDER",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "REALITY_SNI_PLACEHOLDER",
-            "server_port": 443
-          },
-          "private_key": "REALITY_PK_PLACEHOLDER",
-          "short_id": ["REALITY_SID_PLACEHOLDER"]
-        }
-      }
-    }
-INBOUND_REALITY
-        sed -i "s|PORT_REALITY_PLACEHOLDER|$PORT_REALITY|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_REALITY_PLACEHOLDER|$UUID|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
-        need_comma=true
+        inbounds=$(jq -c \
+            --argjson port "$PORT_REALITY" \
+            --arg uuid "$UUID" \
+            --arg sni "$REALITY_SNI" \
+            --arg pk "$REALITY_PK" \
+            --arg sid "$REALITY_SID" \
+            '. + [{
+              type: "vless",
+              tag: "vless-in",
+              listen: "::",
+              listen_port: $port,
+              sniff: true,
+              tcp_fast_open: true,
+              users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+              tls: {
+                enabled: true,
+                server_name: $sni,
+                reality: {
+                  enabled: true,
+                  handshake: {server: $sni, server_port: 443},
+                  private_key: $pk,
+                  short_id: [$sid]
+                }
+              }
+            }]' <<<"$inbounds")
     fi
 
     if $ENABLE_ANYTLS; then
-    $need_comma && echo "," >> "$TEMP_INBOUNDS"
-    cat >> "$TEMP_INBOUNDS" <<'INBOUND_ANYTLS'
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": PORT_ANYTLS_PLACEHOLDER,
-      "users": [
-        {
-          "name": "ANYTLS_USER_PLACEHOLDER",
-          "password": "ANYTLS_PSK_PLACEHOLDER"
-        }
-      ],
-      "padding_scheme": [],
-      "tls": {
-        "enabled": true,
-        "server_name": "REALITY_SNI_PLACEHOLDER",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "REALITY_SNI_PLACEHOLDER",
-            "server_port": 443
-          },
-          "private_key": "REALITY_PK_PLACEHOLDER",
-          "short_id": [
-            "REALITY_SID_PLACEHOLDER"
-          ]
-        }
-      }
-    }
-INBOUND_ANYTLS
-
-    sed -i "s|PORT_ANYTLS_PLACEHOLDER|$PORT_ANYTLS|g" "$TEMP_INBOUNDS"
-    sed -i "s|ANYTLS_USER_PLACEHOLDER|$ANYTLS_USER|g" "$TEMP_INBOUNDS"
-    sed -i "s|ANYTLS_PSK_PLACEHOLDER|$ANYTLS_PSK|g" "$TEMP_INBOUNDS"
-    sed -i "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" "$TEMP_INBOUNDS"
-    sed -i "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" "$TEMP_INBOUNDS"
-    sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
-
-    need_comma=true
+        inbounds=$(jq -c \
+            --argjson port "$PORT_ANYTLS" \
+            --arg name "$ANYTLS_USER" \
+            --arg password "$ANYTLS_PSK" \
+            --arg sni "$REALITY_SNI" \
+            --arg pk "$REALITY_PK" \
+            --arg sid "$REALITY_SID" \
+            '. + [{
+              type: "anytls",
+              tag: "anytls-in",
+              listen: "::",
+              listen_port: $port,
+              users: [{name: $name, password: $password}],
+              tls: {
+                enabled: true,
+                server_name: $sni,
+                reality: {
+                  enabled: true,
+                  handshake: {server: $sni, server_port: 443},
+                  private_key: $pk,
+                  short_id: [$sid]
+                }
+              }
+            }]' <<<"$inbounds")
     fi
 
-    # 生成最终配置
-    cat > "$CONFIG_PATH" <<'CONFIG_HEAD'
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "ntp": {
-    "enabled": true,
-    "server": "time.apple.com",
-    "server_port": 123,
-    "interval": "30m"
-  },
-  "inbounds": [
-CONFIG_HEAD
-    
-    cat "$TEMP_INBOUNDS" >> "$CONFIG_PATH"
-    
-    cat >> "$CONFIG_PATH" <<'CONFIG_TAIL'
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct-out"
-    }
-  ]
-}
-CONFIG_TAIL
-
-    rm -f "$TEMP_INBOUNDS"
+    jq -n --argjson inbounds "$inbounds" '{
+      log: {level: "info", timestamp: true},
+      ntp: {enabled: true, server: "time.apple.com", server_port: 123, interval: "30m"},
+      inbounds: $inbounds,
+      outbounds: [{type: "direct", tag: "direct-out"}]
+    }' > "$CONFIG_PATH"
 
     if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
         info "配置文件验证通过"
@@ -1032,16 +1093,41 @@ CACHEEOF
 }
 
 # 调用配置生成
+if ! $KEEP_EXISTING_CONFIG; then
 create_config
+else
+    info "跳过配置生成，沿用现有 $CONFIG_PATH"
+    [ -n "${SERVICE_PATH:-}" ] || true
+fi
 
 info "配置生成完成，准备设置服务..."
 
 # -----------------------
 # 设置服务
+ensure_service_user() {
+    if id sing-box >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v useradd >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin --home-dir /etc/sing-box sing-box 2>/dev/null \
+            || useradd --system --no-create-home --shell /sbin/nologin sing-box
+    elif command -v adduser >/dev/null 2>&1; then
+        adduser -S -H -s /sbin/nologin -h /etc/sing-box sing-box 2>/dev/null || true
+    fi
+    id sing-box >/dev/null 2>&1 || { err "无法创建 sing-box 系统用户"; exit 1; }
+}
+
 setup_service() {
     info "配置系统服务..."
     SINGBOX_BIN="$(command -v sing-box || true)"
     [ -n "$SINGBOX_BIN" ] || SINGBOX_BIN="/usr/bin/sing-box"
+    ensure_service_user
+    chown -R sing-box:sing-box /etc/sing-box
+    chmod 750 /etc/sing-box
+    chmod 640 /etc/sing-box/config.json 2>/dev/null || true
+    if command -v setcap >/dev/null 2>&1; then
+        setcap cap_net_bind_service=+ep "$SINGBOX_BIN" 2>/dev/null || warn "setcap 失败，443 可能需要额外权限"
+    fi
     
     if [ "$OS" = "alpine" ]; then
         SERVICE_PATH="/etc/init.d/sing-box"
@@ -1053,6 +1139,7 @@ name="sing-box"
 description="Sing-box Proxy Server"
 command="${SINGBOX_BIN}"
 command_args="run -c /etc/sing-box/config.json"
+command_user="sing-box"
 pidfile="/run/\${RC_SVCNAME}.pid"
 command_background="yes"
 output_log="/var/log/sing-box.log"
@@ -1100,13 +1187,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=sing-box
+Group=sing-box
 WorkingDirectory=/etc/sing-box
 ExecStart=${SINGBOX_BIN} run -c /etc/sing-box/config.json
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
@@ -1400,16 +1490,41 @@ read_config() {
         return 1
     fi
     
+    load_kv_file() {
+        local file="$1" line key val
+        [ -f "$file" ] || return 0
+        while IFS= read -r line || [ -n "$line" ]; do
+            [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+            key="${line%%=*}"
+            val="${line#*=}"
+            case "$key" in
+                ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS|CUSTOM_IP|REALITY_SNI|SS_PORT|SS_PSK|SS_METHOD|HY2_PORT|HY2_PSK|TUIC_PORT|TUIC_UUID|TUIC_PSK|REALITY_PORT|REALITY_UUID|REALITY_PK|REALITY_SID|REALITY_PUB|ANYTLS_PORT|ANYTLS_USER|ANYTLS_PSK)
+                    printf -v "$key" '%s' "$val"
+                    ;;
+            esac
+        done < "$file"
+    }
+
+    cache_set() {
+        local file="$1" key="$2" val="$3" tmp
+        tmp=$(mktemp 2>/dev/null || echo "/tmp/cache_set.$$")
+        if [ -f "$file" ]; then
+            awk -v k="$key" -v v="$val" '
+                BEGIN { found=0 }
+                index($0, k"=")==1 { print k"="v; found=1; next }
+                { print }
+                END { if (!found) print k"="v }
+            ' "$file" > "$tmp" && mv "$tmp" "$file"
+        else
+            printf '%s=%s\n' "$key" "$val" > "$file"
+        fi
+        chmod 600 "$file" 2>/dev/null || true
+    }
+
     # 优先加载 .protocols 文件（确认协议标记）
     PROTOCOL_FILE="/etc/sing-box/.protocols"
-    if [ -f "$PROTOCOL_FILE" ]; then
-        . "$PROTOCOL_FILE"
-    fi
-    
-    # 加载缓存文件（包含端口密码等详细配置）
-    if [ -f "$CACHE_FILE" ]; then
-        . "$CACHE_FILE"
-    fi
+    load_kv_file "$PROTOCOL_FILE"
+    load_kv_file "$CACHE_FILE"
     
     # 确保有默认值
     REALITY_SNI="${REALITY_SNI:-}"
@@ -1775,15 +1890,72 @@ action_change_sni() {
       )
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
-    if [ -f "$CACHE_FILE" ]; then
-        if grep -q '^REALITY_SNI=' "$CACHE_FILE"; then
-            sed -i "s|^REALITY_SNI=.*|REALITY_SNI=$new_sni|" "$CACHE_FILE"
-        else
-            echo "REALITY_SNI=$new_sni" >> "$CACHE_FILE"
-        fi
-    fi
+    cache_set "$CACHE_FILE" REALITY_SNI "$new_sni"
 
     info "已更新 Reality SNI: $new_sni"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_rotate_uuid() {
+    read_config || return 1
+    if [ "${ENABLE_REALITY:-false}" != "true" ]; then
+        err "VLESS Reality 未启用"
+        return 1
+    fi
+    local new_uuid
+    new_uuid=$(rand_uuid)
+    info "正在更换 VLESS UUID..."
+    service_stop || warn "停止服务失败"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg uuid "$new_uuid" '
+      .inbounds |= map(if .type=="vless" then .users[0].uuid = $uuid else . end)
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    cache_set "$CACHE_FILE" REALITY_UUID "$new_uuid"
+    chown sing-box:sing-box "$CONFIG_PATH" 2>/dev/null || true
+    info "新 UUID: $new_uuid"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+action_rotate_reality_keys() {
+    read_config || return 1
+    if [ "${ENABLE_REALITY:-false}" != "true" ] && [ "${ENABLE_ANYTLS:-false}" != "true" ]; then
+        err "未启用 Reality / AnyTLS"
+        return 1
+    fi
+    if ! command -v sing-box >/dev/null 2>&1; then
+        err "未找到 sing-box"
+        return 1
+    fi
+    info "正在更换 Reality 密钥和 ShortID..."
+    local keys pk pub sid
+    keys=$(sing-box generate reality-keypair) || { err "生成密钥失败"; return 1; }
+    pk=$(printf '%s' "$keys" | awk '/PrivateKey/{print $NF}' | tr -d '\r')
+    pub=$(printf '%s' "$keys" | awk '/PublicKey/{print $NF}' | tr -d '\r')
+    sid=$(sing-box generate rand 8 --hex) || { err "生成 ShortID 失败"; return 1; }
+    [ -n "$pk" ] && [ -n "$pub" ] && [ -n "$sid" ] || { err "密钥为空"; return 1; }
+
+    service_stop || warn "停止服务失败"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    jq --arg pk "$pk" --arg sid "$sid" '
+      .inbounds |= map(
+        if (.tls.reality.enabled == true) then
+          .tls.reality.private_key = $pk
+          | .tls.reality.short_id = [$sid]
+        else . end
+      )
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    printf '%s' "$pub" > /etc/sing-box/.reality_pub
+    printf '%s' "$sid" > /etc/sing-box/.reality_sid
+    chmod 600 /etc/sing-box/.reality_pub /etc/sing-box/.reality_sid
+    chown sing-box:sing-box "$CONFIG_PATH" /etc/sing-box/.reality_pub /etc/sing-box/.reality_sid 2>/dev/null || true
+    cache_set "$CACHE_FILE" REALITY_PK "$pk"
+    cache_set "$CACHE_FILE" REALITY_PUB "$pub"
+    cache_set "$CACHE_FILE" REALITY_SID "$sid"
+    info "Reality 公钥已更新: $pub"
     service_start || warn "启动服务失败"
     sleep 1
     generate_uris || warn "生成 URI 失败"
@@ -2125,6 +2297,18 @@ MENU
         option=$((option + 1))
     fi
 
+    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
+        echo "$option) 更换 VLESS UUID"
+        MENU_MAP[$option]="rotate_uuid"
+        option=$((option + 1))
+    fi
+
+    if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
+        echo "$option) 更换 Reality 密钥"
+        MENU_MAP[$option]="rotate_keys"
+        option=$((option + 1))
+    fi
+
     # 固定功能选项
     MENU_MAP[$option]="start"
     echo "$option) 启动服务"
@@ -2184,6 +2368,8 @@ while true; do
                 reset_reality) action_reset_reality ;;
                 reset_anytls) action_reset_anytls ;;
                 change_sni) action_change_sni ;;
+                rotate_uuid) action_rotate_uuid ;;
+                rotate_keys) action_rotate_reality_keys ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;

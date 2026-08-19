@@ -17,19 +17,23 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 | 1 | Shadowsocks | `2022-blake3-aes-128-gcm` 或 `aes-128-gcm` |
 | 2 | Hysteria2 | 自签 ECDSA 证书，`insecure=1` |
 | 3 | TUIC | UUID + 密码，BBR |
-| 4 | VLESS Reality | 按出口位置探测附近高校/机构 SNI |
-| 5 | AnyTLS Reality | 与 VLESS 共用 Reality 密钥和 SNI |
+| 4 | VLESS Reality | 默认监听 443；按出口位置探测附近高校/机构 SNI |
+| 5 | AnyTLS Reality | 单独部署时默认 443；与 VLESS 共用 Reality 密钥和 SNI |
 
 可多选，例如 `1 2 4`。
 
 ## 会自动做的事
 
 - 安装最新 sing-box，并配置 systemd / OpenRC 开机自启
+- **以 `sing-box` 系统用户运行**，443 通过 `CAP_NET_BIND_SERVICE` 绑定
 - **开启 BBR**（`fq` + `tcp_congestion_control=bbr`）
 - HY2 / TUIC 额外调大 UDP 缓冲
-- Reality SNI 不再写死 Mozilla，而是探测离这台机器最近、且支持 TLS1.3 + HTTP/2 的高校/机构站点
+- Reality dest 探测：TLS1.3 + HTTP/2 + 证书 SAN 覆盖 SNI，排除 Cloudflare / Fastly / Cloudfront 等 CDN
+- 配置用 `jq` 生成，密码里的 `+` `/` 不会写坏 JSON
+- 缓存按 key=value 读取，不会 `source` 执行
+- 已有安装会询问：保留配置只更新 / 全量重装
 - 端口校验、去重、占用检测
-- 配置和密钥文件权限收紧为 `600`
+- 配置和密钥文件权限收紧
 - IPv6 节点链接自动加 `[]`
 - 装完提示需要放行的防火墙/安全组端口
 
@@ -41,7 +45,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/dukou/ma
 sb
 ```
 
-可以查看链接、改端口、重探 Reality SNI、更新、卸载，以及生成以本机 SS 为出口的线路机脚本。
+可以查看链接、改端口、重探 Reality SNI、更换 VLESS UUID / Reality 密钥、更新、卸载，以及生成以本机 SS 为出口的线路机脚本。
 
 ## 系统
 
