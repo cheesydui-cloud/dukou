@@ -110,6 +110,8 @@ else
         bad "jq values psk=$got_psk pk=$got_pk sni=$got_sni"
     fi
     echo "$cfg" | jq -e '.inbounds|length==2' >/dev/null && ok "two inbounds" || bad "inbound count"
+    sniff_in_inbound=$(printf '%s' "$cfg" | jq '[.inbounds[]|select(.sniff==true)]|length')
+    [ "$sniff_in_inbound" = "0" ] && ok "no legacy sniff on inbound" || bad "legacy sniff still on inbound"
 fi
 
 echo "== installer contains required behaviors =="
@@ -121,6 +123,8 @@ grep -q 'action_rotate_reality_keys' "$INSTALLER" && ok "rotate keys" || bad "ro
 grep -q 'KEEP_EXISTING_CONFIG' "$INSTALLER" && ok "reinstall keep-config" || bad "reinstall keep-config"
 grep -q 'load_kv_file' "$INSTALLER" && ok "safe kv loader" || bad "safe kv loader"
 ! grep -q 'addons.mozilla.org' "$INSTALLER" && ok "no mozilla default sni" || bad "mozilla default still present"
+grep -q 'action: "sniff"' "$INSTALLER" && ok "sniff moved to route action" || bad "sniff route action missing"
+! grep -q 'sniff: true' "$INSTALLER" && ok "no inbound sniff:true" || bad "inbound sniff:true still present"
 grep -Eq 'Subject Alternative Name|subjectAltName|DNS:' "$INSTALLER" && ok "SAN check in probe" || bad "SAN check in probe"
 if grep -n 'sed -i "s|PSK_SS_PLACEHOLDER' "$INSTALLER" >/dev/null; then
     bad "legacy sed placeholder still used for config"

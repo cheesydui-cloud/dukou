@@ -980,7 +980,6 @@ create_config() {
               tag: "vless-in",
               listen: "::",
               listen_port: $port,
-              sniff: true,
               tcp_fast_open: true,
               users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
               tls: {
@@ -1027,7 +1026,12 @@ create_config() {
       log: {level: "info", timestamp: true},
       ntp: {enabled: true, server: "time.apple.com", server_port: 123, interval: "30m"},
       inbounds: $inbounds,
-      outbounds: [{type: "direct", tag: "direct-out"}]
+      outbounds: [{type: "direct", tag: "direct-out"}],
+      route: {
+        rules: [
+          {action: "sniff", timeout: "1s"}
+        ]
+      }
     }' > "$CONFIG_PATH"
 
     if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
